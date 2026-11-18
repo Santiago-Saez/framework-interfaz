@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mini-reactivo · signal + granular + keyed</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111318; color: #e8eaf0; margin: 0; padding: 2rem; }
+  #app { max-width: 640px; margin: auto; display: grid; gap: 1rem; }
+  .card { background: #1b1f27; border: 1px solid #2c3340; border-radius: 12px; padding: 1rem 1.2rem; }
+  button { margin: .25rem; padding: .4rem .7rem; border-radius: 8px; border: 1px solid #3a4356; background: #232a38; color: #fff; cursor: pointer; }
+  input { padding: .45rem .6rem; border-radius: 8px; border: 1px solid #3a4356; background: #0f1218; color: #fff; }
+  li.hecho span { text-decoration: line-through; opacity: .6; }
+  small { opacity: .55; } code { background: #0f1218; padding: 0 .4rem; border-radius: 6px; }
+  footer { opacity: .6; font-size: .85rem; }
+  #err { display: none; background: #4a1620; border: 1px solid #a33; border-radius: 8px; padding: .6rem; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="err"></div>
+<script>
+window.addEventListener('error', function (e) {
+  var d = document.getElementById('err');
+  d.style.display = 'block';
+  d.textContent += 'Error: ' + (e.message || e.error) + '\n';
+});
+</script>
+<script>
+// Micro-framework reactivo sin dependencias (~190 líneas).
+// API: signal, computed, effect, batch, untrack, html, render, each.
+
+// ---------- 1. Señales ----------
+let ctx = null;              // efecto/computo en ejecución
+let batchDepth = 0;
+const pending = new Set();
+const scopeStack = [];       // scopes para dispose de listas/ramas
+
+function flush() {
+  batchDepth++;
+  try {
+    // Consumir uno a uno (sin snapshot): si un computed re-encola un
+    // efecto aún no ejecutado, el Set lo deduplica y corre una sola vez.
+    let f;
+    while ((f = pending.values().next().value) !== undefined) {
+      pending.delete(f);
+      if (!f.disposed) f();
+    }
+  } finally { batchDepth--; }
+}
+
+function notify(subs) {
+  for (const f of subs) if (!f.disposed) pending.add(f);
+  if (batchDepth === 0) flush();
+}
+
+function batch(fn) {
+  batchDepth++;
+  try { fn(); } finally {
+    batchDepth--;
+    if (batchDepth === 0 && pending.size) flush();
+  }
+}
+
+function untrack(fn) {
+  const p = ctx; ctx = null;
+  try { return fn(); } finally { ctx = p; }
+}
+
+function effect(fn) {
+  const e = () => {
+    if (e.disposed) return;
+    for (const s of e.deps) s.delete(e);
+    e.deps.clear();
+    const p = ctx; ctx = e;
+    try { e.cleanup?.(); fn(); }
+    finally { ctx = p; }
+  };
+  e.deps = new Set(); e.disposed = false;
+  e.dispose = () => { e.disposed = true; for (const s of e.deps) s.delete(e); e.deps.clear(); e.cleanup?.(); };
+  e.onCleanup = (f) => (e.cleanup = f);
+  if (scopeStack.length) scopeStack[scopeStack.length - 1].add(e.dispose);
+  e();
+  return e;
+}
+
+function signal(init) {
+  let v = init;
+  const subs = new Set();
+  const get = () => { if (ctx) { subs.add(ctx); ctx.deps.add(subs); } return v; };
+  get.peek = () => v;
+  get.set = (nv) => {
+    nv = typeof nv === "function" ? nv(v) : nv;
+    if (Object.is(nv, v)) return;
+    v = nv; notify(subs);
+  };
+  get.__isSignal = true;
+  return get;
+}
+
+function computed(fn) {
+  const s = signal();
+  effect(() => s.set(fn()));
+  return s;
+}
+
+// ---------- 2. Plantillas granulares ----------
+function html(strings, ...values) {
+  return { __isTpl: true, strings, values };
+}
+
+const isSignal = (x) => typeof x === "function" && x.__isSignal;
+
+function mountValue(marker, value, scope) {
+  const parent = marker.parentNode;
+  const insert = (n) => parent.insertBefore(n, marker);
+  // Ramas condicionales / thunks: sólo re-renderizan este slot
+  if (typeof value === "function" && !isSignal(value)) {
+    const start = document.createComment("b");
+    parent.insertBefore(start, marker);
+    let cur = [], curScope = new Set();
+    effect(() => {
+      curScope.forEach((d) => d()); curScope.clear();
+      cur.forEach((n) => n.remove()); cur = [];
+      scopeStack.push(curScope);
+      try { cur = materialize(value(), curScope); }
+      finally { scopeStack.pop(); }
+      const live = marker.parentNode;
+      cur.forEach((n) => live.insertBefore(n, marker));
+    });
+    return;
+  }
+  if (isSignal(value)) {
+    const t = document.createTextNode(String(value.peek() ?? ""));
+    insert(t);
+    const e = effect(() => { t.data = String(value() ?? ""); });
+    scope?.add(e.dispose);
+    marker.remove();
+    return;
+  }
+  if (value?.__isEach) { mountEach(marker, value, scope); return; }
+  if (value?.__isTpl) {
+    mountTpl(value, parent, marker, scope);
+    marker.remove();
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((v) => {
+      const m = document.createComment("i");
+      parent.insertBefore(m, marker);
+      mountValue(m, v, scope);
+    });
+    marker.remove();
+    return;
+  }
+  if (value?.nodeType) { insert(value); marker.remove(); return; }
+  if (value == null || value === false) { marker.remove(); return; }
+  insert(document.createTextNode(String(value)));
+  marker.remove();
+}
+
+function materialize(v, scope) {
+  const frag = document.createDocumentFragment();
+  const m = document.createComment("m");
+  frag.appendChild(m);
+  mountValue(m, v, scope);
+  if (m.parentNode) m.parentNode.removeChild(m);
+  return [...frag.childNodes];
+}
+
+function mountTpl(tpl, parent, before, scope) {
+  const { strings, values } = tpl;
+  let h = "";
+  for (let i = 0; i < strings.length; i++) {
+    h += strings[i];
+    if (i < values.length) {
+      // ¿dentro de una etiqueta? -> atributo/evento, si no -> hijo
+      const inside = strings[i].lastIndexOf("<") > strings[i].lastIndexOf(">");
+      h += inside ? `__s${i}__` : `<!--s${i}-->`;
+    }
+  }
+  const t = document.createElement("template");
+  t.innerHTML = h;
+  const frag = t.content.cloneNode(true);
+  // 1. Atributos y eventos granulares
+  for (const el of frag.querySelectorAll("*")) {
+    for (const a of [...el.attributes]) {
+      const m = a.value.match(/^__s(\d+)__$/);
+      if (!m) continue;
+      const v = values[+m[1]];
+      const name = a.name;
+      el.removeAttribute(name);
+      if (name.startsWith("on") && typeof v === "function" && !isSignal(v)) {
+        el.addEventListener(name.slice(2), v);
+      } else if (isSignal(v)) {
+        const e = effect(() => setAttr(el, name, v()));
+        scope?.add(e.dispose);
+      } else if (typeof v === "function" && !v.__isTpl) {
+        const e = effect(() => setAttr(el, name, v()));
+        scope?.add(e.dispose);
+      } else setAttr(el, name, v);
+    }
+  }
+  // 2. Slots de hijos (comentarios)
+  const walker = document.createTreeWalker(frag, 128); // 128 = SHOW_COMMENT
+  const marks = [];
+  while (walker.nextNode()) if (/^s\d+$/.test(walker.currentNode.data)) marks.push(walker.currentNode);
+  marks.forEach((c) => mountValue(c, values[+c.data.slice(1)], scope));
+  // 3. Insertar
+  const nodes = [...frag.childNodes];
+  nodes.forEach((n) => parent.insertBefore(n, before ?? null));
+  return nodes;
+}
+
+function setAttr(el, name, v) {
+  if (v == null || v === false) el.removeAttribute(name);
+  else if (name === "value" || name === "checked" || name === "disabled" || name in el) {
+    try { el[name] = v; } catch { el.setAttribute(name, String(v)); }
+    if (typeof v !== "function") el.setAttribute(name, name === "value" ? String(v) : v === true ? "" : String(v));
+    if (v == null || v === false) el.removeAttribute(name);
+  }
+  else el.setAttribute(name, String(v));
+}
+
+// ---------- 3. Listas con clave ----------
+function each(src, keyFn, rowFn) {
+  return { __isEach: true, src, keyFn, rowFn };
+}
+
+function mountEach(marker, { src, keyFn, rowFn }, scope) {
+  const parent = marker.parentNode;
+  const end = document.createComment("end");
+  parent.insertBefore(end, marker);
+  marker.remove();
+  const get = isSignal(src) ? src : typeof src === "function" ? computed(src) : () => src;
+  const cache = new Map(); // key -> { nodes, scope, item }
+  const e = effect(() => {
+    const list = get() ?? [];
+    const seen = new Set();
+    // Reutiliza o crea, en orden, moviendo nodos (sin destruir)
+    batch(() => {
+      for (let i = 0; i < list.length; i++) {
+        const item = list[i];
+        const k = keyFn ? keyFn(item, i) : i;
+        seen.add(k);
+        let row = cache.get(k);
+        // Si el item cambió de identidad (ej. toggle inmutable), recrear
+        // sólo esa fila; el resto se reutiliza.
+        if (row && !Object.is(row.item, item)) {
+          row.scope.forEach((d) => d());
+          row.nodes.forEach((n) => n.remove());
+          cache.delete(k);
+          row = null;
+        }
+        if (!row) {
+          const sc = new Set();
+          scopeStack.push(sc);
+          let nodes;
+          try { nodes = materialize(untrack(() => rowFn(item, i)), sc); }
+          finally { scopeStack.pop(); }
+          row = { nodes, scope: sc, item };
+          cache.set(k, row);
+        }
+        // mover en orden antes de `end` (padre resuelto en vivo)
+        const live = end.parentNode;
+        for (const n of row.nodes) live.insertBefore(n, end);
+      }
+      for (const [k, row] of cache) {
+        if (!seen.has(k)) {
+          row.scope.forEach((d) => d());
+          row.nodes.forEach((n) => n.remove());
+          cache.delete(k);
+        }
+      }
+    });
+  });
+  scope?.add(() => { e.dispose(); cache.forEach((r) => { r.scope.forEach((d) => d()); }); });
+}
+
+function render(tpl, container) {
+  container.textContent = "";
+  const scope = new Set();
+  scopeStack.push(scope);
+  try { mountTpl(tpl, container, null, scope); }
+  finally { scopeStack.pop(); }
+  return () => scope.forEach((d) => d());
+}
+
+// ---------- Demo 1: Contador ----------
+const count = signal(0);
+const doble = computed(() => count() * 2);
+
+const counterView = html`
+  <section class="card">
+    <h2>1 · Contador granular</h2>
+    <p>Cuenta: <strong>${count}</strong> · Doble: <strong>${doble}</strong></p>
+    <button onclick=${() => count.set((c) => c + 1)}>+1</button>
+    <button onclick=${() => count.set((c) => c - 1)}>-1</button>
+    <button onclick=${() => batch(() => { count.set(0); })}>reset</button>
+  </section>`;
+
+// ---------- Demo 2: Lista de tareas (keyed) ----------
+let nextId = 4;
+const tareas = signal([
+  { id: 1, texto: "Aprender signals", hecho: true },
+  { id: 2, texto: "Evitar VDOM", hecho: false },
+  { id: 3, texto: "Reconciliar con clave", hecho: false },
+]);
+const filtro = signal("todas"); // todas | activas | hechas
+const visibles = computed(() => {
+  const f = filtro();
+  const t = tareas();
+  return f === "activas" ? t.filter((x) => !x.hecho)
+       : f === "hechas"  ? t.filter((x) => x.hecho) : t;
+});
+const pendientes = computed(() => tareas().filter((t) => !t.hecho).length);
+
+function toggle(id) {
+  tareas.set((ts) => ts.map((t) => (t.id === id ? { ...t, hecho: !t.hecho } : t)));
+}
+function remove(id) {
+  tareas.set((ts) => ts.filter((t) => t.id !== id));
+}
+
+const inputRef = { el: null };
+function add(e) {
+  e.preventDefault();
+  const v = inputRef.el.value.trim();
+  if (!v) return;
+  tareas.set((ts) => [...ts, { id: nextId++, texto: v, hecho: false }]);
+  inputRef.el.value = "";
+}
+
+const todoView = html`
+  <section class="card">
+    <h2>2 · Tareas con clave</h2>
+    <p>Pendientes: <strong>${pendientes}</strong></p>
+    <form onsubmit=${add}>
+      <input placeholder="Nueva tarea…" ref=${null} />
+      <button>Añadir</button>
+    </form>
+    <div class="filters">
+      <button onclick=${() => filtro.set("todas")}>Todas</button>
+      <button onclick=${() => filtro.set("activas")}>Activas</button>
+      <button onclick=${() => filtro.set("hechas")}>Hechas</button>
+      <span>Filtro: <strong>${filtro}</strong></span>
+    </div>
+    <ul>${each(visibles, (t) => t.id, (t) => html`
+      <li class=${() => (t.hecho ? "hecho" : "")}>
+        <input type="checkbox" checked=${t.hecho} onchange=${() => toggle(t.id)} />
+        <span>${t.texto} <small>#${t.id}</small></span>
+        <button onclick=${() => remove(t.id)}>✕</button>
+      </li>`)}
+    </ul>
+  </section>`;
+
+// ---------- Demo 3: Buscador con debounce ----------
+const DATOS = ["react", "signal", "computed", "effect", "virtual dom",
+  "reconciliación", "granularidad", "plantillas", "debounce", "svelte",
+  "solid", "lit", "vue", "angular", "keyed list", "template literals"];
+const query = signal("");
+const debounced = signal("");
+const buscando = signal(false);
+let timer = null;
+effect(() => {
+  const q = query(); // dependencia rastreada
+  buscando.set(true);
+  clearTimeout(timer);
+  timer = setTimeout(() => batch(() => { debounced.set(q); buscando.set(false); }), 300);
+});
+const resultados = computed(() => {
+  const q = debounced().trim().toLowerCase();
+  if (!q) return DATOS;
+  return DATOS.filter((d) => d.includes(q));
+});
+
+const searchView = html`
+  <section class="card">
+    <h2>3 · Buscador con debounce (300 ms)</h2>
+    <input placeholder="Escribe: signal, dom, list…" oninput=${(e) => query.set(e.target.value)} />
+    <p>Directo: <code>${query}</code> · Debounced: <code>${debounced}</code>
+       ${() => (buscando() ? "⏳ buscando…" : "✓ listo")}</p>
+    <ul>${each(resultados, (x) => x, (x) => html`<li>${x}</li>`)}</ul>
+  </section>`;
+
+// ---------- App ----------
+const app = html`
+  <h1>⚡ Mini-reactivo <small>· sin dependencias</small></h1>
+  ${counterView}${todoView}${searchView}
+  <footer>Abre la consola: verás que escribir NO re-renderiza el contador.</footer>
+`;
+
+render(app, document.getElementById("app"));
+
+// Captura el <input> del form de tareas (sin querySelector en el framework)
+inputRef.el = document.querySelector("form input");
+
+// Log: demuestra granularidad (sólo se dispara lo suscrito)
+effect(() => untrack(() => null)); // warmup
+effect(() => console.log("[granular] count =", count()));
+effect(() => console.log("[granular] tareas =", tareas().length, "| filtro =", filtro()));
+effect(() => console.log("[granular] debounce =", JSON.stringify(debounced())));
+
+</script>
+</body>
+</html>
